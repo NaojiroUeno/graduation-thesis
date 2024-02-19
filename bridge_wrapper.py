@@ -1,7 +1,13 @@
 '''
 A Moduele which binds Yolov7 repo with Deepsort with modifications
 '''
-
+from scipy.spatial.qhull import QhullError
+from scipy.spatial import ConvexHull
+from sklearn.cluster import KMeans
+from sklearn.cluster import DBSCAN
+from scipy.spatial import ConvexHull
+import matplotlib.pyplot as plt
+from google.colab.patches import cv2_imshow
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' # comment out below line to enable tensorflow logging outputs
 import time
@@ -52,6 +58,66 @@ def calc_K(fov_x, pixel_w, pixel_h, cx=None, cy=None):
     ])
 
     return K
+
+
+#######################################################
+import torch
+from model import vgg19
+
+# 訓練済み重みのパスを指定
+model_path = 'model_nwpu.pth'
+
+# デバイスをCPUに指定
+device = torch.device('cpu')
+
+# モデルを構築
+model = vgg19()
+model.to(device)
+model.load_state_dict(torch.load(model_path, device))
+model.eval()
+
+import cv2
+import copy
+import numpy as np
+from PIL import Image
+from torchvision import transforms
+
+# 推論用関数
+def inference(model, image):
+    # 前処理
+    input_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    input_image = transforms.ToTensor()(input_image).unsqueeze(0)
+    input_image = input_image.to(device)
+
+    # 推論
+    with torch.set_grad_enabled(False):
+        outputs, _ = model(input_image)
+
+    # マップ取得
+    result_map = outputs[0, 0].cpu().numpy()
+
+    # マップから人数を計測
+    count = torch.sum(outputs).item()
+
+    return result_map, int(count)
+
+# マップ可視化用関数
+def create_color_map(result_map, image):
+    color_map = copy.deepcopy(result_map)
+
+    # 0～255の範囲に正規化して、疑似カラーを適用
+    color_map = (color_map - color_map.min()) / (color_map.max() - color_map.min() + 1e-5)
+    color_map = (color_map * 255).astype(np.uint8)
+    color_map = cv2.applyColorMap(color_map, cv2.COLORMAP_JET)
+
+    # リサイズして元画像と合成
+    image_width, image_height = image.shape[1], image.shape[0]
+    color_map = cv2.resize(color_map, dsize=(image_width, image_height))
+    debug_image = cv2.addWeighted(image, 0.35, color_map, 0.65, 1.0)
+
+    return color_map, debug_image
+
+#######################################################
 
 class YOLOv7_DeepSORT:
     '''
@@ -138,6 +204,80 @@ class YOLOv7_DeepSORT:
 
             if skip_frames and not frame_num % skip_frames: continue # skip every nth frame. When every frame is not important, you can use this to fasten the process
             if verbose >= 1:start_time = time.time()
+
+            #####################################################
+            result_map, count = inference(model, frame)
+            color_map, debug_image = create_color_map(result_map, frame)
+            cv2.imwrite('./debug_image.jpg', debug_image)
+
+            img = cv2.imread('./debug_image.jpg')
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            img = (img - 127.5) / 127.5
+            img = 0.5 * img + 0.5
+
+            threshold_value = 0.65
+            threshold_img = img.copy()
+            threshold_img[threshold_img < threshold_value] = 0
+            cv2.imwrite('./threshold_img.jpg', threshold_img)
+
+            image_path = './threshold_img.jpg'
+            image = cv2.imread(image_path)
+
+            # 特徴マップの作成（ここでは単純に青チャンネルを使用）
+            feature_map = image[:, :, 0]
+
+            # 黒色以外のピクセルを取得
+            non_black_pixels = feature_map[feature_map > 0].reshape(-1, 1)
+
+            # K平均クラスタリング
+            kmeans = KMeans(n_clusters=3)  # クラスタ数は適宜調整
+            kmeans.fit(non_black_pixels)
+
+            # クラスタに各ピクセルを割り当て
+            labels = kmeans.predict(non_black_pixels)
+
+            #  クラスタごとに色を割り当てる
+            clustered_image = np.zeros_like(feature_map)
+            clustered_image[feature_map > 0] = labels + 1  # 0は背景なのでクラスタ番号を1から始める
+
+            image_path = './threshold_img.jpg'
+            image = cv2.imread(image_path)
+            
+            # base_image_path = './only_YOLOv5.jpeg'    # 基準画像のパス
+            base_image = frame
+            
+            # 特徴マップの作成（ここでは単純に青チャンネルを使用）
+            feature_map = image[:, :, 0]
+            
+            # 黒色以外のピクセルを取得
+            non_black_pixels = np.column_stack(np.where(feature_map > 0))
+            
+            # DBSCANクラスタリング
+            dbscan = DBSCAN(eps=100, min_samples=1)  # epsやmin_samplesは適宜調整
+            labels = dbscan.fit_predict(non_black_pixels)
+            
+            # クラスタに各ピクセルを割り当て
+            clustered_image = np.zeros_like(feature_map)
+            for label, pixel in zip(labels, non_black_pixels):
+              clustered_image[pixel[0], pixel[1]] = label + 1  # 0は背景なのでクラスタ番号を1から始める
+
+            unique_labels = np.unique(labels)
+            for label in unique_labels:
+              cluster_points = non_black_pixels[labels == label]
+              if len(cluster_points) >= 3:
+                try:
+                  hull = ConvexHull(cluster_points)
+                  for simplex in hull.simplices:
+                      plt.plot(cluster_points[simplex, 1], cluster_points[simplex, 0], color='red')
+                except QhullError as e:
+                # Handle QhullError if necessary
+                  print(f"QhullError: {e}")
+                # hull = ConvexHull(cluster_points)
+                # for simplex in hull.simplices:
+                #   plt.plot(cluster_points[simplex, 1], cluster_points[simplex, 0], color='red')
+
+
 
             # -----------------------------------------PUT ANY DETECTION MODEL HERE -----------------------------------------------------------------
             yolo_dets = self.detector.detect(frame.copy(), plot_bb = False)  # Get the detections
@@ -286,7 +426,7 @@ class YOLOv7_DeepSORT:
                       print("ID '" + str(group[l][0]) + "' and ID '" + str(group[l][1]) + "' are group!")
                 
 
-                ## 速度ベクトルを使用してグループ化どうかを判断 ##
+                ## 速度ベクトルを使用してグループかどうかを判断 ##
                 delta = []
                 if frame_num % 5 == 0:
                   for i in range(len(center)):
